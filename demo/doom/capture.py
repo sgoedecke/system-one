@@ -1,4 +1,4 @@
-"""Real campaign capture: batched Qwen decisions, asynchronous 35 Hz game."""
+"""Real campaign capture: periodic Qwen plans and asynchronous 35 Hz game."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -20,6 +20,8 @@ from demo.labels import LabelSystemOne, label_questions
 
 FPS = 35
 MODEL = "Qwen/Qwen3-8B"
+PLAN_HEADS = ("goal", "target")
+CONTROL_HEADS = ("dodge", "move", "strafe", "turn", "fire", "weapon", "use")
 BUTTONS = [
     vzd.Button.MOVE_FORWARD_BACKWARD_DELTA, vzd.Button.MOVE_BACKWARD,
     vzd.Button.MOVE_LEFT, vzd.Button.MOVE_RIGHT,
@@ -39,7 +41,7 @@ QUESTIONS = {
             "Add armor": "Collect nearby armor when health and ammunition are adequate and armor is below 20.",
             "Reach exit": "Advance toward the real level exit when no enemy is visible and health/ammo are adequate.",
         }),
-    "target": Choice(instructions="Select destination matching the ACTIVE committed goal, not a goal selected in this batch." + ENDING,
+    "target": Choice(instructions="Select destination matching the newly selected planning goal." + ENDING,
                      criteria={"Campaign exit": "Real campaign exit."}),
     "dodge": Choice(
         instructions="Choose evasion while pursuing the ACTIVE goal. Examples: no enemies => choice_index:0; close enemy and left clear => choice_index:1; enemy touching and backward clear => choice_index:3." + ENDING,
@@ -55,6 +57,13 @@ QUESTIONS = {
             "Forward": "Route waypoint is within 35 degrees ahead and forward clearance exceeds 45. Approach targets, including distant enemies.",
             "Hold": "Route waypoint is more than 35 degrees away from crosshair; turn before moving. Also hold if destination reached.",
             "Backward": "Stuck against an obstacle and backward clearance exceeds 65.",
+        }),
+    "strafe": Choice(
+        instructions="Choose sideways movement independently of forward/backward movement and turning. Sidestep obstacles when stuck, even if the wall-only forward clearance says clear. One index digit.",
+        criteria={
+            "Hold": "Not stuck and forward clear, or neither side has clearance above 70.",
+            "Strafe left": "Stuck or forward blocked, and left clearance exceeds 70. Prefer left when both sides are clear.",
+            "Strafe right": "Stuck or forward blocked, left clearance is at most 70, and right clearance exceeds 70.",
         }),
     "turn": Choice(
         instructions="Turn toward the explicitly described AIM direction. Positive bearing means left. Examples: AIM left 40 degrees => choice_index:0; AIM left 5 => choice_index:1; AIM centered => choice_index:2; AIM right 5 => choice_index:3; AIM right 40 => choice_index:4." + ENDING,
@@ -331,6 +340,21 @@ def start_episode(game,skill=2):
     return inv
 
 
+def targets_for_goal(goal, enemies, candidates, scout):
+    categories={"Upgrade weapon":"Weapon","Stock ammo":"Ammo","Restore health":"Health","Add armor":"Armor","Reach exit":"Exit","Kill enemies":"Enemy"}
+    desired=categories.get(goal)
+    if desired=="Enemy":
+        relevant=[]
+        for enemy in sorted(enemies,key=lambda e:e["distance"])[:3]:
+            relevant.append(dict(enemy,mode="engage"))
+            relevant.append(dict(enemy,id=enemy["id"]+"-approach",name="Approach "+enemy["name"],mode="navigate"))
+    else:
+        relevant=[p for p in candidates if p["kind"]==desired][:4]
+    exits=[p for p in candidates if p["kind"]=="Exit"][:1]
+    pool=relevant if relevant else (scout[:3] if goal=="Scout" else exits+scout[:2])
+    return [dict(p) for p in {p["id"]:p for p in pool}.values()][:9]
+
+
 def observe(game,state,nav,goal,target,memory):
     get=lambda name:float(game.get_game_variable(getattr(vzd.GameVariable,name)))
     x,y,angle=get("POSITION_X"),get("POSITION_Y"),get("ANGLE")
@@ -362,16 +386,6 @@ def observe(game,state,nav,goal,target,memory):
     candidates=[dict(item) for item in nav.items if item["id"] in present]
     candidates.sort(key=lambda item:math.hypot(item["x"]-x,item["y"]-y))
     obs["nearest_armor_distance"]=min((round(math.hypot(p["x"]-x,p["y"]-y)) for p in candidates if p["kind"]=="Armor"),default=None)
-    categories={"Upgrade weapon":"Weapon","Stock ammo":"Ammo","Restore health":"Health","Add armor":"Armor","Reach exit":"Exit","Kill enemies":"Enemy"}
-    desired=categories.get(goal)
-    if desired=="Enemy":
-        relevant=[]
-        for enemy in sorted(enemies,key=lambda e:e["distance"])[:3]:
-            relevant.append(dict(enemy,mode="engage"))
-            relevant.append(dict(enemy,id=enemy["id"]+"-approach",name="Approach "+enemy["name"],mode="navigate"))
-    else:
-        relevant=[p for p in candidates if p["kind"]==desired][:4]
-    exits=[p for p in candidates if p["kind"]=="Exit"][:1]
     scout=[]
     for cell in nav.valid[::max(1,len(nav.valid)//100)]:
         c=tuple(cell)
@@ -382,13 +396,14 @@ def observe(game,state,nav,goal,target,memory):
                 scout.append({"id":f"scout-{sx}-{sy}","name":f"Corridor {len(scout)+1}",
                               "kind":"Scout","x":sx,"y":sy})
     scout.sort(key=lambda p:math.hypot(p["x"]-x,p["y"]-y))
-    pool=relevant if relevant else (scout[:3] if goal=="Scout" else exits+scout[:2])
-    unique={p["id"]:p for p in pool}
-    obs["targets"]=list(unique.values())[:9]
+    obs["target_pools"]={name:targets_for_goal(name,enemies,candidates,scout)
+                         for name in QUESTIONS["goal"].criteria}
+    for pool in obs["target_pools"].values():
+        for candidate in pool:
+            candidate["distance"]=round(math.hypot(candidate["x"]-x,candidate["y"]-y))
+    obs["targets"]=obs["target_pools"][goal]
     if not obs["targets"]:
         raise RuntimeError("No campaign targets")
-    for candidate in obs["targets"]:
-        candidate["distance"]=round(math.hypot(candidate["x"]-x,candidate["y"]-y))
     base_id=target["id"].removesuffix("-approach")
     live_enemy=next((e for e in enemies if e["id"]==base_id),None)
     live_target=dict(target,x=live_enemy["x"],y=live_enemy["y"]) if live_enemy else target
@@ -423,7 +438,7 @@ def describe(obs):
     return (
         f"CURRENT SITUATION: Health {obs['health']}; armor {obs['armor']}. {combat}\n"
         f"Equipped {obs['selected_weapon']}; equipped ammo {obs['selected_weapon_ammo']}; shells {obs['shells']}; pistol bullets {obs['bullets']}; own shotgun {obs['own_shotgun']}. Nearby armor distance: {armor}.\n"
-        f"ACTIVE PLAN FROM PREVIOUS BATCH: {obs['active_goal']} / {obs['active_target']['name']}. Controls follow this old plan; new goal and target apply next cycle.\n"
+        f"ACTIVE COMMITTED PLAN: {obs['active_goal']} / {obs['active_target']['name']}. All controls follow this plan.\n"
         f"NAVIGATION: Route {'aligned ahead' if abs(obs['route_bearing'])<=35 else 'NOT aligned ahead'}; final destination distance {obs['target_distance']}. "
         f"AIM {aim}, offset {abs(obs['aim_bearing'])} degrees.\n"
         f"Forward corridor {'clear' if obs['clearance']['forward']>45 else 'blocked'}. Wall clearance: "+
@@ -449,6 +464,9 @@ def questions_for(obs, label_map=None):
         criteria={"Carry on":"Threat SAFE.","Dodge left":"Threat DANGER and left CLEAR.",
                   "Dodge right":"Threat DANGER, left BLOCKED, right CLEAR.",
                   "Dodge back":"Threat DANGER, sideways BLOCKED, backward CLEAR."})
+    questions["strafe"]=Choice(
+        instructions=f"Sideways navigation: stuck = {obs['stuck']}; forward wall clearance {'CLEAR' if obs['clearance']['forward']>45 else 'BLOCKED'}; left {'CLEAR' if obs['clearance']['left']>70 else 'BLOCKED'}; right {'CLEAR' if obs['clearance']['right']>70 else 'BLOCKED'}. Wall clearance does not include barrels or other actors. When stuck, sidestep toward a clear side even if forward wall clearance is CLEAR. Emergency dodge takes priority over this strafe choice. One index digit.",
+        criteria=QUESTIONS["strafe"].criteria)
     questions["weapon"]=Choice(
         instructions=f"Which weapon should be equipped? Shotgun {'LOADED' if obs['shells']>0 else 'EMPTY'}, shells {obs['shells']}; pistol bullets {obs['bullets']}. One index digit.",
         criteria={"Pistol":"Shotgun EMPTY.","Shotgun":"Shotgun LOADED."})
@@ -460,7 +478,7 @@ def questions_for(obs, label_map=None):
         instructions=f"Route toward committed destination is {'aligned ahead' if abs(obs['route_bearing'])<=35 else 'NOT aligned ahead'}. Forward is {'clear' if obs['clearance']['forward']>45 else 'blocked'}. Stuck: {obs['stuck']}. Choose movement. One index digit.",
         criteria=QUESTIONS["move"].criteria)
     questions["target"]=Choice(
-        instructions=f"Committed goal: {obs['active_goal']}. Select the target. For combat, choose Approach for a distant enemy beyond 220 units; engage an enemy within 220. For other goals choose its matching item or exit." + ENDING,
+        instructions=f"Selected planning goal: {obs['active_goal']}. Select the target. For combat, choose Approach for a distant enemy beyond 220 units; engage an enemy within 220. For other goals choose its matching item or exit." + ENDING,
         criteria={p["name"]:(f"Navigate toward this {'DISTANT' if p['distance']>220 else 'NEAR'} enemy, distance {p['distance']}; approach before aiming." if p.get("mode")=="navigate" else
                              f"Stand and aim at this {'NEAR' if p['distance']<=220 else 'DISTANT'} enemy, distance {p['distance']}." if p.get("mode")=="engage" else
                              f"{p['kind']} destination, distance {p['distance']} units.") for p in obs["targets"]})
@@ -469,26 +487,127 @@ def questions_for(obs, label_map=None):
 
 def controls(answers):
     a={k:v["choice"] for k,v in answers.items()}
+    sideways=a["strafe"] if a["dodge"]=="Carry on" else a["dodge"]
     return [14*int(a["move"]=="Forward"),int(a["move"]=="Backward" or a["dodge"]=="Dodge back"),
-            int(a["dodge"]=="Dodge left"),int(a["dodge"]=="Dodge right"),
+            int(sideways in {"Strafe left","Dodge left"}),int(sideways in {"Strafe right","Dodge right"}),
             {"Hard left":-2.0,"Left":-.7,"Fine left":-.15,"Hold":0,"Fine right":.15,"Right":.7,"Hard right":2.0}[a["turn"]],
             int(a["fire"]=="Fire"),int(a["weapon"]=="Pistol"),int(a["weapon"]=="Shotgun"),int(a["use"]=="Use")]
 
 
-def infer(engine,obs,cache):
+def infer(engine,obs,cache,heads,clock=time.perf_counter):
     text=describe(obs)
-    questions=questions_for(obs, getattr(engine, "label_map", None))
-    start=time.perf_counter()
+    if tuple(heads) == ("target",):
+        # The snapshot's route still describes the previous destination.
+        text="\n".join(text.splitlines()[:2])
+        text+=f"\nNEW SELECTED PLANNING GOAL: {obs['active_goal']}."
+    questions={key:q for key,q in questions_for(obs, getattr(engine, "label_map", None)).items()
+               if key in heads}
+    start=clock()
     result=engine.system_one(text,questions,cache_prefix=cache)
-    latency=(time.perf_counter()-start)*1000
+    latency=(clock()-start)*1000
+    if set(result.answers) != set(heads):
+        raise ValueError(f"Expected answers for {heads}, got {tuple(result.answers)}")
     answers={key:{"choice":answer.choice,"probabilities":answer.probabilities} for key,answer in result.answers.items()}
-    return answers,latency,text
+    for key,answer in answers.items():
+        if answer["choice"] not in questions[key].criteria:
+            raise ValueError(f"Invalid {key} choice: {answer['choice']}")
+    return {"answers":answers,"latency_ms":latency,"model_state":text,
+            "questions":{k:{"instructions":q.instructions,"criteria":q.criteria} for k,q in questions.items()}}
+
+
+def infer_request(engine,request,cache,clock=time.perf_counter):
+    """One worker owns both planning stages; its snapshots contain no game objects."""
+    started=clock()
+    obs=request["observation"]
+    kind=request["kind"]
+    if kind=="plan":
+        goal_result=infer(engine,obs,cache,("goal",),clock)
+        goal=goal_result["answers"]["goal"]["choice"]
+        target_obs=dict(obs,active_goal=goal,targets=obs["target_pools"][goal])
+        if not target_obs["targets"]:
+            raise ValueError(f"No candidates for selected goal {goal}")
+        target_result=infer(engine,target_obs,cache,("target",),clock)
+        target_name=target_result["answers"]["target"]["choice"]
+        targets=[p for p in target_obs["targets"] if p["name"]==target_name]
+        if len(targets)!=1:
+            raise ValueError(f"Target must identify one actual candidate: {target_name}")
+        result={"answers":{**goal_result["answers"],**target_result["answers"]},
+                "questions":{**goal_result["questions"],**target_result["questions"]},
+                "model_state":{"goal":goal_result["model_state"],"target":target_result["model_state"]},
+                "goal_latency_ms":goal_result["latency_ms"],"target_latency_ms":target_result["latency_ms"],
+                "control_latency_ms":None,"active_goal":goal,"active_target":targets[0]}
+        result["latency_ms"]=result["goal_latency_ms"]+result["target_latency_ms"]
+    elif kind=="control":
+        result=infer(engine,obs,cache,CONTROL_HEADS,clock)
+        result.update(control_latency_ms=result["latency_ms"],goal_latency_ms=None,target_latency_ms=None)
+    else:
+        raise ValueError(f"Unknown inference kind {kind}")
+    completed=clock()
+    result.update(kind=kind,episode=request["episode"],plan_id=request["plan_id"],
+                  evaluated_heads=list(PLAN_HEADS if kind=="plan" else CONTROL_HEADS),
+                  observation_frame=request["frame"],worker_started=started,worker_completed=completed,
+                  worker_wall_ms=(completed-started)*1000,
+                  planning_latency_ms=(completed-started)*1000 if kind=="plan" else None)
+    return result
+
+
+def positive_integer(value):
+    try:
+        number=int(value)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError("must be a positive integer") from None
+    if number<=0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+class PlanCadence:
+    """Advance only when a completed control inference is actually applied."""
+    def __init__(self,every):
+        self.every=positive_integer(every)
+        self.plan_id=0
+        self.reset(1)
+
+    def reset(self,episode):
+        self.episode=episode
+        self.has_plan=False
+        self.controls_since_plan=0
+        self.answers={}
+        self.questions={}
+        self.last_control_applied=None
+        self.last_control_frame=None
+
+    @property
+    def next_kind(self):
+        return "plan" if not self.has_plan or self.controls_since_plan>=self.every else "control"
+
+    def accepts(self,result):
+        return result["episode"]==self.episode and result["plan_id"]==self.plan_id
+
+    def commit(self,result,applied_at,frame):
+        if not self.accepts(result):
+            return False
+        if result["kind"]!=self.next_kind:
+            raise ValueError("Inference result does not match the scheduled cadence")
+        if result["kind"]=="plan":
+            self.plan_id+=1
+            self.has_plan=True
+            self.controls_since_plan=0
+        else:
+            self.controls_since_plan+=1
+            self.last_control_applied=applied_at
+            self.last_control_frame=frame
+        self.answers.update(result["answers"])
+        self.questions.update(result["questions"])
+        return True
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output",type=Path,required=True)
     parser.add_argument("--seconds",type=float,default=100)
+    parser.add_argument("--plan-every",type=positive_integer,default=3,
+                        help="Replan after this many applied, completed control inferences (default: 3)")
     parser.add_argument("--seed",type=int,default=7)
     parser.add_argument("--level",default="MAP01")
     parser.add_argument("--cache-prefix",action="store_true")
@@ -552,10 +671,15 @@ def main():
         "label_encoding":"two-letter" if args.labels else "numeric",
         "torch":torch.__version__,"transformers":transformers.__version__,"vizdoom":vzd.__version__,
         "observation_source":"Visible actor labels and game variables, plus actual WAD item/exit coordinates and collision geometry. Grid A* supplies a route waypoint bearing; it never selects controls. No image input to the model.",
-        "control_method":"All eight heads in one SystemOne call, with demo-only label prompt encoding if enabled. Inference core unchanged. Every input button and turn direction selected by model; no aim/fire/navigation override.",
-        "temporal_dependency":"Each batch controls the goal and target committed by the previous completed batch. New goal and target are committed for the following observation, not retroactively applied to this batch controls.",
-        "cache_prefix":args.cache_prefix,"forward_passes_per_batch":2 if args.cache_prefix else 1,
-        "timing":"Game advances 35 Hz while worker inference runs; model-selected buttons remain held between completed batches.",
+        "control_method":"Seven control heads per SystemOne call, including independent navigation strafe. Emergency dodge takes priority over strafe. Planning uses a goal call then a target call conditioned on that new goal. Single worker; inference core unchanged. Every input button and turn direction selected by model; no aim/fire/navigation override.",
+        "temporal_dependency":"Initial plan, then plan after each N applied completed control inferences. Both goal and target commit together; the next control request observes that committed plan. Previous buttons remain held during planning.",
+        "plan_every":args.plan_every,"cadence_unit":"applied_completed_control_inferences",
+        "schema_version":2,"planning_heads":list(PLAN_HEADS),"control_heads":list(CONTROL_HEADS),
+        "cache_prefix":args.cache_prefix,
+        "forward_passes_per_model_call":{"goal":1,"target":1,"control":2 if args.cache_prefix else 1},
+        "forward_passes_per_plan":2,
+        "model_calls_per_plan":2,"model_calls_per_control":1,
+        "timing":"35 Hz game clock is independent of plan cadence; no planning timer. Model latencies time system_one calls; planning latency includes both stages and prompt preparation. Control gaps measure actual applications including intervening planning and polling.",
         "loadout_commands":["give shotgun","take Shell 999",f"give Shell {1 if args.skill==1 else 2}","take Clip 999",f"give Clip {15 if args.skill==1 else 30}"],
         "inventory_policy":"Loadout initialized only at recorded episode starts. No refills, invulnerability, teleports, enemy respawns or scripted actions.",
         "capture_source_sha256":hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -572,8 +696,15 @@ def main():
         memory={"positions":[]}
         obs=observe(game,game.get_state(),nav,goal,target,memory)
         print("MAP",len(nav.valid),"cells",len(nav.items),"items; starting",initial,flush=True)
+        warmups=[]
         for _ in range(2):
-            infer(engine,obs,args.cache_prefix)
+            warm_request={"kind":"plan","episode":0,"plan_id":0,"frame":0,"observation":obs}
+            warm_plan=infer_request(engine,warm_request,args.cache_prefix)
+            warm_obs=observe(game,game.get_state(),nav,warm_plan["active_goal"],warm_plan["active_target"],memory)
+            warm_control=infer_request(engine,dict(warm_request,kind="control",observation=warm_obs),args.cache_prefix)
+            warmups.append({"plan":warm_plan,"control":warm_control})
+        metadata["warmup_model_ms"]=sum(r["latency_ms"] for warmup in warmups for r in warmup.values())
+        memory={"positions":[]}
         (args.output/"metadata.json").write_text(json.dumps(metadata,indent=2))
         print("MODEL READY; recording",flush=True)
         with ThreadPoolExecutor(max_workers=1) as worker,(args.output/"decisions.jsonl").open("w",buffering=1) as decisions, \
@@ -585,8 +716,18 @@ def main():
             future=None
             request=None
             episode=1
+            cadence=PlanCadence(args.plan_every)
             batch=0
             latencies=[]
+            plan_latencies=[]
+            goal_latencies=[]
+            target_latencies=[]
+            control_gaps=[]
+            model_ms=0.
+            discarded_model_ms=0.
+            plan_count=0
+            controls_plan_id=None
+            answer_frames={}
             total_kills=0
             last_kills=0
             late=0
@@ -598,11 +739,15 @@ def main():
                     reason="death" if game.is_player_dead() else "level_finished_or_timeout"
                     if future:
                         discarded=future.result()
-                        events.write(json.dumps({"frame":frame,"event":"discarded_episode_boundary_batch","answers":discarded[0],"model_state":discarded[2]})+"\n")
+                        discarded_model_ms+=discarded["latency_ms"]
+                        events.write(json.dumps({"frame":frame,"event":"discarded_episode_boundary_inference","result":discarded})+"\n")
                         future=None
                     total_kills+=last_kills
                     last_kills=0
                     episode+=1
+                    cadence.reset(episode)
+                    controls_plan_id=None
+                    answer_frames={}
                     inv=start_episode(game,args.skill)
                     nav=CampaignMap(wad,args.level,args.skill)
                     goal="Reach exit"
@@ -612,35 +757,81 @@ def main():
                     event={"frame":frame,"event":"episode_reset","reason":reason,"episode":episode,"inventory":inv}
                     resets.append(event)
                     events.write(json.dumps(event)+"\n")
+                    decisions.write(json.dumps({"frame":frame,"batch":batch,"kind":"reset","episode":episode,
+                        "latency_ms":0,"answers":{},"evaluated_heads":[],"plan_updated":False,
+                        "plan_id":cadence.plan_id,"controls_since_plan":0,"action":action})+"\n")
                 state=game.get_state()
+                completed=None
                 if future and future.done():
-                    answers,latency,text=future.result()
+                    completed=future.result()
                     future=None
-                    action=controls(answers)
-                    batch+=1
-                    latencies.append(latency)
-                    row={"frame":frame,"batch":batch,"latency_ms":latency,"episode":episode,"answers":answers,
-                         "action":action,"selected_controls":dict(zip(metadata["buttons"],action)),
-                         "observation":request["observation"],"model_state":text,"observation_frame":request["frame"],
-                         "questions":{k:{"instructions":q.instructions,"criteria":q.criteria} for k,q in questions_for(request["observation"],label_map).items()},
-                         "active_goal":request["observation"]["active_goal"],"active_target":request["observation"]["active_target"],
-                         "next_goal":answers["goal"]["choice"],"next_target":answers["target"]["choice"],
-                         "health":inventory(game)["health"],"ammo":inventory(game)["selected_weapon_ammo"],
-                         "kills":total_kills+int(game.get_game_variable(vzd.GameVariable.KILLCOUNT))}
-                    decisions.write(json.dumps(row)+"\n")
-                    goal=answers["goal"]["choice"]
-                    target=next(p for p in request["observation"]["targets"] if p["name"]==answers["target"]["choice"])
-                    if batch%20==0:
-                        print(f"frame={frame} batch={batch} health={row['health']} kills={row['kills']} cells={request['observation']['visited_cells']} "
-                              f"latency={latency:.0f} "+str({k:v["choice"] for k,v in answers.items()}),flush=True)
-                if future is None:
+                    if not cadence.accepts(completed):
+                        discarded_model_ms+=completed["latency_ms"]
+                        events.write(json.dumps({"frame":frame,"event":"discarded_stale_inference","result":completed})+"\n")
+                        completed=None
+                    elif completed["kind"]=="control":
+                        action=controls(completed["answers"])
+                    else:
+                        goal=completed["active_goal"]
+                        target=completed["active_target"]
+                if future is None and completed is None:
                     obs=observe(game,state,nav,goal,target,memory)
-                    request={"frame":frame,"observation":obs}
-                    future=worker.submit(infer,engine,obs,args.cache_prefix)
+                    request={"kind":cadence.next_kind,"episode":episode,"plan_id":cadence.plan_id,
+                             "frame":frame,"observation":obs,"submitted":time.perf_counter()}
+                    future=worker.submit(infer_request,engine,request,args.cache_prefix)
                 last_kills=int(game.get_game_variable(vzd.GameVariable.KILLCOUNT))
+                inv=inventory(game)
                 Image.fromarray(state.screen_buffer).save(frames/f"{frame:06d}.jpg",quality=92)
                 audio.writeframesraw(state.audio_buffer.tobytes())
+                applied_at=time.perf_counter()
                 game.make_action(action,1)
+                if completed is not None:
+                    control_gap_ms=(applied_at-cadence.last_control_applied)*1000 if (
+                        completed["kind"]=="control" and cadence.last_control_applied is not None) else None
+                    control_gap_frames=frame-cadence.last_control_frame if control_gap_ms is not None else None
+                    cadence.commit(completed,applied_at,frame)
+                    batch+=1
+                    model_ms+=completed["latency_ms"]
+                    if completed["kind"]=="control":
+                        controls_plan_id=cadence.plan_id
+                        latencies.append(completed["control_latency_ms"])
+                        if control_gap_ms is not None:
+                            control_gaps.append(control_gap_ms)
+                    else:
+                        plan_count+=1
+                        plan_latencies.append(completed["planning_latency_ms"])
+                        goal_latencies.append(completed["goal_latency_ms"])
+                        target_latencies.append(completed["target_latency_ms"])
+                    answer_frames.update({head:request["frame"] for head in completed["evaluated_heads"]})
+                    row={**completed,"frame":frame,"batch":batch,"episode":episode,
+                         "plan_id":cadence.plan_id,"plan_updated":completed["kind"]=="plan",
+                         "controls_since_plan":cadence.controls_since_plan,"controls_plan_id":controls_plan_id,
+                         "answers":dict(cadence.answers),"questions":dict(cadence.questions),
+                         "answer_observation_frames":dict(answer_frames),
+                         "action":action,"selected_controls":dict(zip(metadata["buttons"],action)),
+                         "observation":request["observation"],"active_goal":goal,"active_target":target,
+                         "request_wall_seconds":request["submitted"]-started,
+                         "applied_wall_seconds":applied_at-started,
+                         "request_to_apply_ms":(applied_at-request["submitted"])*1000,
+                         "completion_to_apply_ms":(applied_at-completed["worker_completed"])*1000,
+                         "control_gap_ms":control_gap_ms,"control_gap_frames":control_gap_frames,
+                         "health":inv["health"],"ammo":inv["selected_weapon_ammo"],
+                         "kills":total_kills+last_kills}
+                    decisions.write(json.dumps(row)+"\n")
+                    if completed["kind"]=="plan":
+                        events.write(json.dumps({"frame":frame,"event":"plan_committed","episode":episode,
+                            "plan_id":cadence.plan_id,"goal":goal,"target":target,
+                            "controls_since_plan":0,"result":completed})+"\n")
+                    if batch%20==0:
+                        print(f"frame={frame} batch={batch} kind={completed['kind']} plan={cadence.plan_id} "
+                              f"controls={cadence.controls_since_plan} health={inv['health']} "
+                              f"latency={completed['latency_ms']:.0f}",flush=True)
+                    # Submit from a fresh main-thread snapshot, without waiting another 35 Hz tick.
+                    if not game.is_episode_finished() and not game.is_player_dead() and frame+1<round(args.seconds*FPS):
+                        obs=observe(game,game.get_state(),nav,goal,target,memory)
+                        request={"kind":cadence.next_kind,"episode":episode,"plan_id":cadence.plan_id,
+                                 "frame":frame+1,"observation":obs,"submitted":time.perf_counter()}
+                        future=worker.submit(infer_request,engine,request,args.cache_prefix)
                 remaining=started+(frame+1)/FPS-time.perf_counter()
                 if remaining>0:
                     time.sleep(remaining)
@@ -649,12 +840,26 @@ def main():
             elapsed=time.perf_counter()-started
             if future:
                 pending=future.result()
-                events.write(json.dumps({"frame":frame+1,"event":"unapplied_final_batch","answers":pending[0],"model_state":pending[2]})+"\n")
+                discarded_model_ms+=pending["latency_ms"]
+                events.write(json.dumps({"frame":frame+1,"event":"unapplied_final_inference","result":pending})+"\n")
         metadata.update(total_frames=frame+1,duration_seconds=(frame+1)/FPS,capture_wall_seconds=elapsed,
-                        late_frames=late,decisions=batch,episodes=episode,resets=resets,kills=total_kills+last_kills,
+                        late_frames=late,decisions=batch,control_updates=len(latencies),plans=plan_count,
+                        episodes=episode,resets=resets,kills=total_kills+last_kills,
                         median_latency_ms=float(np.median(latencies)) if latencies else None,
                         p95_latency_ms=float(np.percentile(latencies,95)) if latencies else None,
-                        actual_decisions_per_second=batch/elapsed,final_inventory=inventory(game),
+                        median_control_latency_ms=float(np.median(latencies)) if latencies else None,
+                        p95_control_latency_ms=float(np.percentile(latencies,95)) if latencies else None,
+                        actual_decisions_per_second=batch/elapsed,actual_controls_per_second=len(latencies)/elapsed,
+                        applied_model_ms=model_ms,unapplied_model_ms=discarded_model_ms,
+                        recording_model_ms=model_ms+discarded_model_ms,
+                        planning_wall_ms=sum(plan_latencies),goal_model_ms=sum(goal_latencies),
+                        target_model_ms=sum(target_latencies),control_model_ms=sum(latencies),
+                        median_planning_latency_ms=float(np.median(plan_latencies)) if plan_latencies else None,
+                        median_goal_latency_ms=float(np.median(goal_latencies)) if goal_latencies else None,
+                        median_target_latency_ms=float(np.median(target_latencies)) if target_latencies else None,
+                        median_control_gap_ms=float(np.median(control_gaps)) if control_gaps else None,
+                        p95_control_gap_ms=float(np.percentile(control_gaps,95)) if control_gaps else None,
+                        max_control_gap_ms=max(control_gaps) if control_gaps else None,final_inventory=inventory(game),
                         explored_cells=len(nav.visited),collected_or_passed=sorted(nav.collected))
         (args.output/"metadata.json").write_text(json.dumps(metadata,indent=2))
         print("COMPLETE",json.dumps({k:v for k,v in metadata.items() if k not in {"questions","buttons"}}),flush=True)

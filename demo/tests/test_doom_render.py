@@ -122,7 +122,73 @@ class PlanningRendererTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "1–10"):
             render.read_capture(self.root, None)
 
+    def test_plan_commit_visible_before_controls_and_retained_freshness(self):
+        self.metadata.update(schema_version=2, plan_every=3)
+        plan = dict(self.row, kind="plan", plan_id=1, plan_updated=True,
+                    controls_since_plan=0, controls_plan_id=None,
+                    evaluated_heads=["goal", "target"],
+                    answers={key: self.row["answers"][key] for key in ("goal", "target")})
+        self.row = plan
+        self.write_capture()
+        _, _, rows, metadata = render.read_capture(self.root, None)
+        with patch.object(render.Composer, "text", autospec=True) as text:
+            render.Composer(metadata, rows)
+        self.assertIn("Plan every 3 control updates", [call.args[3] for call in text.call_args_list])
+        composer = render.Composer(metadata, rows)
+        self.assertEqual(composer.keys, list(render.LEGACY_HEAD_ORDER))
+        with patch.object(composer, "text", wraps=composer.text) as text:
+            composer.update(plan)
+        strings = [call.args[2] for call in text.call_args_list]
+        self.assertEqual(strings.count("Deciding..."), 6)
+        self.assertEqual(strings.count("NEW PLAN #1"), 2)
+        control = dict(plan, kind="control", plan_updated=False, controls_since_plan=1,
+                       controls_plan_id=1, evaluated_heads=list(render.HEAD_ORDER[2:]))
+        with patch.object(composer, "text", wraps=composer.text) as text:
+            composer.update(control)
+        strings = [call.args[2] for call in text.call_args_list]
+        self.assertEqual(strings.count("RETAINED PLAN #1"), 2)
+        self.assertIn("Upgrade weapon", strings)
+        self.assertIn("1/3 control updates since plan  /  Controls held from plan #1", strings)
+        reset = dict(plan, kind="reset", answers={}, plan_updated=False,
+                     evaluated_heads=[], controls_since_plan=0)
+        self.row = reset
+        self.write_capture()
+        render.read_capture(self.root, None)
+        with patch.object(composer, "text", wraps=composer.text) as text:
+            composer.update(reset)
+        self.assertEqual([call.args[2] for call in text.call_args_list].count("Deciding..."), 8)
+
+    def test_rejects_falsely_fresh_plan_metadata(self):
+        self.metadata.update(schema_version=2, plan_every=3)
+        self.row.update(kind="control", plan_id=1, plan_updated=True, controls_since_plan=1,
+                        evaluated_heads=list(render.LEGACY_HEAD_ORDER[2:]))
+        self.write_capture()
+        with self.assertRaisesRegex(ValueError, "plan_updated"):
+            render.read_capture(self.root, None)
+
     def test_real_encoder_shape_count_audio_and_cache(self):
+        self.metadata.update(schema_version=2, plan_every=3,
+                             control_heads=list(render.HEAD_ORDER[2:]))
+        self.row.update(kind="control", plan_id=1, plan_updated=False,
+                        controls_since_plan=1, controls_plan_id=1,
+                        evaluated_heads=list(render.HEAD_ORDER[2:]))
+        self.row["answers"]["strafe"] = {
+            "choice": "Strafe left",
+            "probabilities": {"Hold": .1, "Strafe left": .8, "Strafe right": .1}}
+        turns = ["Hard left", "Left", "Fine left", "Hold", "Fine right", "Right", "Hard right"]
+        self.row["answers"]["turn"] = {
+            "choice": "Hold", "probabilities": {name: float(name == "Hold") for name in turns}}
+        self.write_capture()
+        _, _, rows, metadata = render.read_capture(self.root, None)
+        composer = render.Composer(metadata, rows)
+        self.assertEqual(composer.controls, list(render.HEAD_ORDER[2:]))
+        with patch.object(composer, "card", wraps=composer.card) as card:
+            composer.update(self.row)
+        for call in card.call_args_list:
+            x, y, width, height = call.args[3]
+            self.assertLessEqual(x + width, render.WIDTH)
+            self.assertLessEqual(y + height, render.HEIGHT)
+        self.assertEqual(len(card.call_args_list), 9)
         with wave.open(str(self.root / "audio.wav"), "wb") as audio:
             audio.setnchannels(2)
             audio.setsampwidth(2)

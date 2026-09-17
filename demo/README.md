@@ -37,17 +37,19 @@ validate Qwen3-8B metadata. The Wikipedia default revision is
 `b968826d9c46dd6066d109eabc6255188de91218`.
 All output paths below are relative, and capture directories must be new.
 
-## Doom: actual Freedoom MAP01, eight simultaneous heads
+## Doom: actual Freedoom MAP01, periodic planning and seven control heads
 
 ```sh
 python -m demo.doom.capture --output demo/output/doom-numeric \
-  --seconds 100 --seed 7 --level MAP01 --skill 1 --cache-prefix
+  --seconds 100 --seed 7 --level MAP01 --skill 1 --plan-every 3 --cache-prefix
 python -m demo.doom.render --input demo/output/doom-numeric \
   --output demo/output/doom-numeric.mp4
 ```
 
-This is the successful selected **pilot10 controller**, not later experimental
-controllers. Defaults preserve its 100-second easy (`--skill 1`) setup:
+This extends the selected **pilot10 controller** with a new planning
+cadence and independent navigation strafing (the existing selected video
+predates these changes).
+Defaults preserve its 100-second easy (`--skill 1`) setup:
 two shotgun shells, 30 pistol bullets, no god mode. There is no claim that this
 controller completes the level. `--probe` records a local game/map observation
 without loading the model.
@@ -70,15 +72,60 @@ It does not introduce a policy adjustment.
 
 The model sees text built from visible actor labels, inventory, WAD item/exit
 coordinates, and a collision-grid A* waypoint bearing—not screenshots.
-`goal`, `target`, `dodge`, `move`, `turn`, `fire`, `weapon`, and `use` share a call.
-Controls use the **previous committed plan**, while new goal/target choices take
-effect on the next observation. The game runs at 35 Hz with the last selected
-buttons held while asynchronous inference completes. Shared-prefix caching
-uses prefix prefill plus a batched suffix forward, not eight generation loops.
+An initial plan calls `goal`, then calls `target` with candidates and context
+conditioned on the **newly chosen goal**. Both choices commit together.
+Each subsequent control inference batches only `dodge`, `move`, `strafe`, `turn`, `fire`,
+`weapon`, and `use`, from a fresh observation of that committed plan.
+`strafe` chooses Hold, Strafe left, or Strafe right independently of forward
+movement and turning. Its prompt allows sidestepping when stuck, including
+against actors such as barrels that wall clearance does not capture.
+An emergency dodge takes priority over navigation strafe, so opposing
+left/right buttons are never applied together. No scripted obstacle response
+is added: the model chooses whether and where to strafe.
+After **three completed control inferences have actually been applied**, the
+worker plans again. `--plan-every` sets this positive-integer count (default 3);
+it does not count game ticks, attempts, warmups, or discarded results, and is
+not a wall-clock timer. New plans and episode resets restart the count.
+One worker serializes all model calls; the two planning calls run consecutively
+without a game-tick wait between them. The game runs at 35 Hz with the last
+model-selected buttons held during both control inference and planning.
+Shared-prefix caching uses prefix prefill plus a batched suffix forward for the
+seven-head control call. Each single-head planning call always uses one forward,
+including when `--cache-prefix` is enabled; a complete plan uses two forwards.
+`forward_passes_per_model_call` records these counts separately as
+`{"goal": 1, "target": 1, "control": 2}` with caching (control is 1 without it).
+These are not nine generation loops. The inference core is unchanged.
 
 Capture writes metadata, decisions/events JSONL, JPEG frames and stereo WAV;
 label mode also writes `labelmap.json`. The renderer shows the recorded decisions,
 not reconstructed choices; `--fps` resamples playback without changing speed.
+
+The version-2 decision stream has explicit `kind: plan|control|reset` rows.
+A plan row is emitted as soon as the coherent plan is committed, before its
+first control result. All nine cards stay visible: unknown controls say
+“Deciding”; later rows retain previous answers and their question criteria.
+`evaluated_heads` identifies only newly inferred heads; `plan_updated` and
+`plan_id` distinguish new plans from retained planning answers.
+`controls_since_plan` counts applied updates, while `controls_plan_id` records
+which plan produced the currently held buttons (possibly the previous plan
+on a plan-commit row). Reset rows clear all cards. `observation_frame` is the
+request snapshot frame; `answer_observation_frames` retains each head's source
+frame, including older answers. Planning stages share one immutable snapshot,
+with only the new goal and its candidate set substituted for target selection.
+
+Timing is explicit: `goal_latency_ms`, `target_latency_ms`, and
+`control_latency_ms` time the corresponding model calls. `latency_ms` is their
+sum for that row, not the cost of retained answers. `planning_latency_ms` and
+`worker_wall_ms` include preparation and the complete worker task.
+`request_to_apply_ms` includes queueing and main-loop polling;
+`completion_to_apply_ms` measures the delay after the worker finishes.
+`control_gap_ms` / `control_gap_frames` measure successive actual control
+applications within an episode, **including intervening planning**.
+Metadata aggregates model time, planning time, control rate and gap percentiles
+separately. Warmup time and unapplied/discarded model time are separate; the
+final unapplied inference may finish after `capture_wall_seconds` ends.
+`decisions` counts plan plus control rows; `control_updates` counts controls
+only. Events also record plan commits and discarded/final unapplied results.
 
 Assets are the Freedoom WAD shipped by ViZDoom, not commercial Doom assets.
 Attribution: [Freedoom contributors](https://freedoom.github.io/),

@@ -31,7 +31,8 @@ except ImportError as exc:
 
 WIDTH, HEIGHT = 1920, 1080
 GAME_BOX = (40, 232, 1040, 982)
-HEAD_ORDER = ("goal", "target", "dodge", "move", "turn", "fire", "weapon", "use")
+HEAD_ORDER = ("goal", "target", "dodge", "move", "strafe", "turn", "fire", "weapon", "use")
+LEGACY_HEAD_ORDER = tuple(key for key in HEAD_ORDER if key != "strafe")
 BG = "#090f19"
 PANEL = "#111e2d"
 STROKE = "#24394b"
@@ -68,6 +69,9 @@ def read_capture(root, limit):
         raise ValueError("This renderer expects 640x480 source images")
     if metadata.get("model") not in ("Qwen/Qwen3-8B", "Qwen3-8B"):
         raise ValueError("metadata model must be Qwen/Qwen3-8B")
+    if metadata.get("schema_version") == 2:
+        if integer(metadata.get("plan_every"), "metadata plan_every") == 0:
+            raise ValueError("metadata plan_every must be positive")
     frames = sorted((root / "frames").glob("[0-9][0-9][0-9][0-9][0-9][0-9].jpg"))
     if limit is not None:
         frames = frames[:limit]
@@ -106,8 +110,24 @@ def read_capture(root, limit):
                 answers = row.get("answers")
                 if not isinstance(answers, dict):
                     raise ValueError("answers must be an object")
-                if not 1 <= len(answers) <= 8:
-                    raise ValueError("answers must contain 1–8 question heads")
+                reset = row.get("kind") == "reset"
+                if not (0 if reset else 1) <= len(answers) <= 9:
+                    raise ValueError("answers must contain 1–9 question heads")
+                if metadata.get("schema_version") == 2:
+                    kind = row.get("kind")
+                    expected = {"plan": HEAD_ORDER[:2],
+                                "control": metadata.get("control_heads", LEGACY_HEAD_ORDER[2:]),
+                                "reset": ()}
+                    if kind not in expected or row.get("evaluated_heads") != list(expected[kind]):
+                        raise ValueError("kind and evaluated_heads must match")
+                    if row.get("plan_updated") is not (kind == "plan"):
+                        raise ValueError("plan_updated must identify plan commits only")
+                    integer(row.get("plan_id"), "plan_id")
+                    integer(row.get("controls_since_plan"), "controls_since_plan")
+                    if not set(expected[kind]).issubset(answers):
+                        raise ValueError("answers must include every evaluated head")
+                    if kind == "reset" and answers:
+                        raise ValueError("reset must clear retained answers")
                 for key, answer in answers.items():
                     if not isinstance(answer, dict):
                         raise ValueError(f"{key} must be an answer object")
@@ -135,8 +155,8 @@ def read_capture(root, limit):
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"{label}: {exc}") from exc
     keys = set().union(*(row["answers"] for row in decisions)) if decisions else set()
-    if len(keys) > 8:
-        raise ValueError("Capture contains more than eight distinct question heads")
+    if len(keys) > 9:
+        raise ValueError("Capture contains more than nine distinct question heads")
     return source_fps, frames, decisions, metadata
 
 
@@ -178,15 +198,16 @@ class Composer:
         self.questions = questions if isinstance(questions, dict) else {}
         self.row_questions = {}
         actual = list(dict.fromkeys(key for row in decisions for key in row["answers"]))
-        keys = actual or list(self.questions) or list(HEAD_ORDER)
+        keys = list(HEAD_ORDER[:2]) + list(metadata.get("control_heads", LEGACY_HEAD_ORDER[2:])) if metadata.get("schema_version") == 2 else (
+            actual or list(self.questions) or list(HEAD_ORDER))
         self.keys = [key for key in HEAD_ORDER if key in keys]
         self.keys += [key for key in keys if key not in self.keys]
-        if len(self.keys) > 8:
-            raise ValueError("The planning layout supports at most eight heads")
+        if len(self.keys) > 9:
+            raise ValueError("The planning layout supports at most nine heads")
         self.planning = [key for key in ("goal", "target") if key in self.keys]
         self.controls = [key for key in self.keys if key not in self.planning]
-        if len(self.controls) > 6:
-            raise ValueError("Expected goal/target planning heads and at most six control heads")
+        if len(self.controls) > 7:
+            raise ValueError("Expected goal/target planning heads and at most seven control heads")
         self.base = Image.new("RGB", (WIDTH, HEIGHT), BG)
         draw = ImageDraw.Draw(self.base)
         for y in range(HEIGHT):
@@ -202,6 +223,9 @@ class Composer:
             self.text(draw, (252, 124 + index * 27), line, "body")
         self.text(draw, (40, 204), "01 / LEVEL", "label", MUTED)
         self.text(draw, (1080, 204), "02 / PLANNING", "label", MUTED)
+        if metadata.get("schema_version") == 2:
+            self.text(draw, (1270, 204), f"Plan every {metadata['plan_every']} control updates",
+                      "compact", CYAN)
         self.text(draw, (1880, 204), "SELECTED ANSWER", "label", MINT, "ra")
         x0, y0, x1, y1 = GAME_BOX
         draw.rectangle((x0 - 3, y0 - 3, x1 + 3, y1 + 3), fill=STROKE)
@@ -243,12 +267,14 @@ class Composer:
             question = " / ".join(map(str, question))
         return str(question)
 
-    def card(self, draw, key, answer, box, prominent):
+    def card(self, draw, key, answer, box, prominent, freshness=None):
         x, y, w, h = box
         draw.rounded_rectangle((x, y, x + w, y + h), 14, fill=PANEL, outline=STROKE)
         draw.rounded_rectangle((x, y + 14, x + 3, y + h - 14), 2, fill=CYAN)
         label = "MOVEMENT" if key == "move" else key.upper().replace("_", " ")
         self.text(draw, (x + 16, y + 12), label, "label", CYAN)
+        if freshness:
+            self.text(draw, (x + w - 16, y + 12), freshness, "tiny", MUTED, "ra")
         chosen = answer["choice"] if answer else "Deciding..."
         if prominent:
             self.text(draw, (x + 16, y + 38), self.fit(self.description(key, chosen), "tiny", w - 32),
@@ -290,12 +316,15 @@ class Composer:
         canvas = self.base.copy()
         draw = ImageDraw.Draw(canvas)
         status = ("Waiting for first decision" if decision is None else
-                  f"BATCH {decision['batch']}  /  {decision['latency_ms']:,.0f} ms")
+                  f"{decision.get('kind', 'batch').upper()} {decision['batch']}  /  {decision['latency_ms']:,.0f} ms")
         self.text(draw, (1550, 64), status, "small", MUTED, "rm")
         answers = decision["answers"] if decision else {}
         self.row_questions = decision.get("questions", {}) if decision else {}
+        freshness = None
+        if decision and decision.get("kind") in ("plan", "control"):
+            freshness = f"{'NEW' if decision['plan_updated'] else 'RETAINED'} PLAN #{decision['plan_id']}"
         for index, key in enumerate(self.planning):
-            self.card(draw, key, answers.get(key), (1080 + index * 408, 232, 392, 304), True)
+            self.card(draw, key, answers.get(key), (1080 + index * 408, 232, 392, 304), True, freshness)
         self.text(draw, (1080, 540), "CONTROL CONTEXT / COMMITTED PLAN", "label", CYAN)
         goal = decision.get("active_goal") if decision else None
         target = decision.get("active_target") if decision else None
@@ -304,9 +333,18 @@ class Composer:
         context = f"Goal: {goal if goal is not None else '—'}   /   Target: {target if target is not None else '—'}"
         for index, line in enumerate(self.wrap(context, "compact", 800, 2)):
             self.text(draw, (1080, 565 + index * 21), line, "compact", WHITE)
+        if decision and decision.get("kind") in ("plan", "control"):
+            controls_plan = decision.get("controls_plan_id")
+            held = "Controls: deciding" if controls_plan is None else f"Controls held from plan #{controls_plan}"
+            self.text(draw, (1080, 596),
+                      f"{decision['controls_since_plan']}/{self.metadata['plan_every']} control updates since plan  /  {held}",
+                      "tiny", MUTED)
         for index, key in enumerate(self.controls):
+            row = index // 2
+            heights = (108, 144, 96, 84) if len(self.controls) == 7 else (144, 144, 144)
             self.card(draw, key, answers.get(key),
-                      (1080 + index % 2 * 408, 616 + index // 2 * 148, 392, 144), False)
+                      (1080 + index % 2 * 408, 616 + sum(heights[:row]) + row * 4,
+                       392, heights[row]), False)
         if decision:
             episode = decision.get("episode")
             if episode is not None:

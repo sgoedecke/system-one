@@ -9,7 +9,7 @@ from demo.tests.test_labels import Model, Tokenizer
 
 
 class DoomQuestionTests(unittest.TestCase):
-    def test_all_eight_dynamic_heads_keep_policy_and_translate_format(self):
+    def test_all_nine_dynamic_heads_keep_policy_and_translate_format(self):
         # No game process or ViZDoom installation is needed to inspect prompts.
         with patch.dict(sys.modules, {"vizdoom": MagicMock()}):
             capture = importlib.import_module("demo.doom.capture")
@@ -24,7 +24,7 @@ class DoomQuestionTests(unittest.TestCase):
         mapping = LabelSystemOne(Model(), Tokenizer()).label_map
         numeric = capture.questions_for(observation)
         labels = capture.questions_for(observation, mapping)
-        self.assertEqual(list(labels), ["goal", "target", "dodge", "move", "turn", "fire", "weapon", "use"])
+        self.assertEqual(list(labels), ["goal", "target", "dodge", "move", "strafe", "turn", "fire", "weapon", "use"])
         for name in numeric:
             self.assertEqual(labels[name].criteria, numeric[name].criteria)
             self.assertNotIn("index digit", labels[name].instructions)
