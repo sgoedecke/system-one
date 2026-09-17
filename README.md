@@ -8,18 +8,27 @@ No server, HTTP transport, or generation loop.
 
 Both demos use a warm **Qwen3-8B** model on an RTX 4090.
 
-- **[Watch the Wikipedia race (MP4)](docs/demos/wikirace-qwen3-8b.mp4)**:
-  Baseball → Scientific American → Amateur astronomy → Sun in **3 hops**.
-  A 100-way tournament selects among actual article links: **9.36 seconds
-  excluding page loads**, or 27.85 seconds total. The race clock pauses while
-  pages load. This experiment uses a demo-specific adapter with 100 single-token
-  labels, rather than the library's default numeric indexes.
-- **[Watch the Doom level demo (MP4)](docs/demos/doom-qwen3-8b.mp4)**:
-  100 seconds of Freedoom MAP01 with eight planning and control choices.
-  Starting with two shotgun shells forces a pistol switch; later goals include
-  collecting armor and reaching a medkit. The model receives textual game-state
-  observations and route bearings, not screenshots. This selected take uses easy
-  difficulty and does not reach the exit.
+### Wikipedia race
+
+https://github.com/user-attachments/assets/68bf0f86-4357-4881-85c3-55df36a3beb6
+
+Baseball → Scientific American → Amateur astronomy → Sun in **3 hops**.
+A 100-way tournament selects among actual article links: **9.36 seconds
+excluding page loads**, or 27.85 seconds total. The race clock pauses while
+pages load. This experiment uses a demo-specific adapter with 100 single-token
+labels, rather than the library's default numeric indexes.
+[Download the MP4](docs/demos/wikirace-qwen3-8b.mp4).
+
+### Doom level
+
+https://github.com/user-attachments/assets/07938d1f-3c2a-4067-8c4b-9e2160e93162
+
+100 seconds of Freedoom MAP01 with eight planning and control choices.
+Starting with two shotgun shells forces a pistol switch; later goals include
+collecting armor and reaching a medkit. The model receives textual game-state
+observations and route bearings, not screenshots. This selected take uses easy
+difficulty and does not reach the exit.
+[Download the MP4](docs/demos/doom-qwen3-8b.mp4).
 
 The demos enable shared-prefix caching: multi-question calls share a prefix
 prefill before a batched question-suffix forward; single-question calls use one
