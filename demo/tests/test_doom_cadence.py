@@ -201,6 +201,26 @@ class CadenceTests(unittest.TestCase):
             self.assertIn("kill all enemies in the way", text)
             self.assertIn(capture.STANDING_ORDER, text)
 
+    def test_tool_backend_uses_choose_and_preserves_unscored_answers(self):
+        obs = observation("Add armor")
+        response = self.engine.system_one("", capture.questions_for(obs))
+        for answer in response.answers.values():
+            answer.probabilities = None
+        tool = SimpleNamespace(inference_mode="tool_agent",
+                               choose=MagicMock(return_value=response))
+        result = capture.infer(tool, obs, False, tuple(capture.QUESTIONS), self.clock)
+        tool.choose.assert_called_once()
+        self.assertTrue(all(answer["probabilities"] is None for answer in result["answers"].values()))
+
+    def test_tool_backend_rejects_single_token_options(self):
+        for option in ("--labels", "--cache-prefix"):
+            with patch.object(sys, "argv", ["capture", "--output", "unused",
+                                           "--controller", "tool-agent", option]), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    capture.main()
+                self.assertEqual(caught.exception.code, 2)
+
     def test_invalid_answers_and_model_errors_propagate(self):
         for head in ("goal", "target"):
             original = self.engine.system_one
@@ -229,7 +249,7 @@ class CadenceTests(unittest.TestCase):
                 capture.main()
         self.assertEqual(caught.exception.code, 2)
 
-    def capture_fixture(self, reset_at=None, pending_at=None, cache_prefix=False):
+    def capture_fixture(self, reset_at=None, pending_at=None, cache_prefix=False, tool_agent=False):
         root = Path(__file__).parent / f".doom-fixture-{uuid.uuid4().hex}"
         root.mkdir()
         self.addCleanup(shutil.rmtree, root)
@@ -250,6 +270,24 @@ class CadenceTests(unittest.TestCase):
                               visited={0}, collected=set())
         inv = {"health": 100, "shells": 2, "bullets": 30, "selected_weapon_ammo": 2}
         original = capture.infer_request
+        if tool_agent:
+            self.engine.inference_mode = "tool_agent"
+            self.engine.trace = []
+            self.engine.reset = MagicMock()
+            turns = []
+
+            def choose(text, questions):
+                result = self.engine.system_one(text, questions)
+                if tuple(questions) == capture.CONTROL_HEADS:
+                    head = "move" if len(turns) % 2 == 0 else "strafe"
+                    turns.append(head)
+                    result.answers = {head: result.answers[head]}
+                    result.answers[head].choice = "Forward" if head == "move" else "Strafe left"
+                for answer in result.answers.values():
+                    answer.probabilities = None
+                return result
+
+            self.engine.choose = choose
 
         def inference(engine, request, cache):
             return original(engine, request, cache, self.clock)
@@ -266,7 +304,8 @@ class CadenceTests(unittest.TestCase):
         worker.__enter__.return_value.submit.side_effect = submit
         with patch.object(sys, "argv", ["capture", "--output", str(root / "capture"),
                                        "--seconds", str(12 / 35), "--device", "cpu"] +
-                                      (["--cache-prefix"] if cache_prefix else [])), \
+                                      (["--cache-prefix"] if cache_prefix else []) +
+                                      (["--controller", "tool-agent"] if tool_agent else [])), \
                 patch.object(capture, "create_game", return_value=game), \
                 patch.object(capture, "CampaignMap", return_value=nav), \
                 patch.object(capture, "start_episode", side_effect=start), \
@@ -274,6 +313,7 @@ class CadenceTests(unittest.TestCase):
                 patch.object(capture, "observe", side_effect=lambda g, s, n, goal, target, memory:
                              observation(goal, target)), \
                 patch.object(capture.SystemOne, "from_pretrained", return_value=self.engine), \
+                patch("demo.doom.tool_agent.ToolAgent.from_pretrained", return_value=self.engine), \
                 patch.object(capture, "ThreadPoolExecutor", return_value=worker), \
                 patch.object(capture, "infer_request", side_effect=inference), \
                 patch.object(capture.time, "perf_counter", self.clock), \
@@ -311,6 +351,19 @@ class CadenceTests(unittest.TestCase):
         self.assertEqual(metadata["plan_every"], 3)
         self.assertEqual(metadata["forward_passes_per_model_call"], {"goal": 1, "target": 1, "control": 1})
         self.assertEqual(metadata["forward_passes_per_plan"], 2)
+
+    def test_tool_turns_apply_partial_controls_without_waiting_for_other_heads(self):
+        rows, metadata, _ = self.capture_fixture(tool_agent=True)
+        controls = [row for row in rows if row["kind"] == "control"]
+        self.assertEqual(controls[0]["evaluated_heads"], ["move"])
+        self.assertEqual(controls[0]["action"][:4], [14, 0, 0, 0])
+        self.assertEqual(controls[1]["evaluated_heads"], ["strafe"])
+        self.assertEqual(controls[1]["action"][:4], [14, 0, 1, 0])
+        self.assertNotIn("fire", controls[1]["answers"])
+        self.assertEqual([row["controls_since_plan"] for row in controls[:4]], [1, 2, 3, 1])
+        self.assertEqual(metadata["controller"], "tool_agent")
+        self.assertIsNone(metadata["forward_passes_per_model_call"])
+        self.engine.reset.assert_called_once()
 
     def test_cached_forward_pass_metadata_distinguishes_single_planning_heads(self):
         _, metadata, _ = self.capture_fixture(cache_prefix=True)

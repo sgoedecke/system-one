@@ -166,6 +166,34 @@ class PlanningRendererTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "plan_updated"):
             render.read_capture(self.root, None)
 
+    def test_native_tool_calls_have_no_fabricated_probabilities(self):
+        self.metadata["controller"] = "tool_agent"
+        self.row["questions"] = {
+            key: {"criteria": dict.fromkeys(answer["probabilities"], "Tool option")}
+            for key, answer in self.row["answers"].items()}
+        for answer in self.row["answers"].values():
+            answer["probabilities"] = None
+        self.write_capture()
+        _, _, rows, metadata = render.read_capture(self.root, None)
+        with patch.object(render.Composer, "text", autospec=True) as text:
+            composer = render.Composer(metadata, rows)
+            composer.update(rows[0])
+        strings = [call.args[3] for call in text.call_args_list]
+        self.assertIn("TOOL-CALL AGENT / DOOM", strings)
+        self.assertIn("TOOL CALL / NO PROBABILITY SCORES", strings)
+        self.assertFalse(any("%" in str(value) for value in strings))
+        with patch.object(composer, "text", wraps=composer.text) as text:
+            composer.update(None)
+        self.assertIn("Not called", [call.args[2] for call in text.call_args_list])
+        self.row["answers"]["goal"]["probabilities"] = {"Upgrade weapon": 1.0}
+        self.write_capture()
+        with self.assertRaisesRegex(ValueError, "must not claim choice probabilities"):
+            render.read_capture(self.root, None)
+        self.row["answers"]["goal"].update(choice="Invented", probabilities=None)
+        self.write_capture()
+        with self.assertRaisesRegex(ValueError, "must occur in its tool options"):
+            render.read_capture(self.root, None)
+
     def test_real_encoder_shape_count_audio_and_cache(self):
         self.metadata.update(schema_version=2, plan_every=3,
                              control_heads=list(render.HEAD_ORDER[2:]))

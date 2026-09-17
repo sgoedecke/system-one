@@ -118,13 +118,22 @@ def read_capture(root, limit):
                     expected = {"plan": HEAD_ORDER[:2],
                                 "control": metadata.get("control_heads", LEGACY_HEAD_ORDER[2:]),
                                 "reset": ()}
-                    if kind not in expected or row.get("evaluated_heads") != list(expected[kind]):
+                    evaluated = row.get("evaluated_heads")
+                    partial = metadata.get("controller") == "tool_agent" and kind == "control"
+                    if kind not in expected:
+                        raise ValueError("kind and evaluated_heads must match")
+                    valid = (isinstance(evaluated, list) and bool(evaluated)
+                             and all(isinstance(head, str) for head in evaluated)
+                             and len(set(evaluated)) == len(evaluated)
+                             and set(evaluated).issubset(expected[kind])) if partial else (
+                                 evaluated == list(expected[kind]))
+                    if not valid:
                         raise ValueError("kind and evaluated_heads must match")
                     if row.get("plan_updated") is not (kind == "plan"):
                         raise ValueError("plan_updated must identify plan commits only")
                     integer(row.get("plan_id"), "plan_id")
                     integer(row.get("controls_since_plan"), "controls_since_plan")
-                    if not set(expected[kind]).issubset(answers):
+                    if not set(evaluated).issubset(answers):
                         raise ValueError("answers must include every evaluated head")
                     if kind == "reset" and answers:
                         raise ValueError("reset must clear retained answers")
@@ -132,6 +141,13 @@ def read_capture(root, limit):
                     if not isinstance(answer, dict):
                         raise ValueError(f"{key} must be an answer object")
                     probabilities = answer.get("probabilities")
+                    if metadata.get("controller") == "tool_agent":
+                        if probabilities is not None:
+                            raise ValueError("tool-agent answers must not claim choice probabilities")
+                        question = row.get("questions", {}).get(key, metadata.get("questions", {}).get(key, {}))
+                        if answer.get("choice") not in question.get("criteria", {}):
+                            raise ValueError(f"{key}.choice must occur in its tool options")
+                        continue
                     if not isinstance(probabilities, dict) or not 1 <= len(probabilities) <= 10:
                         raise ValueError(f"{key}.probabilities must have 1–10 named options")
                     if any(not isinstance(option, str) or not option for option in probabilities):
@@ -213,7 +229,9 @@ class Composer:
         for y in range(HEIGHT):
             draw.line((0, y, WIDTH, y), fill=(9, 17 + y * 6 // HEIGHT, 27 + y * 9 // HEIGHT))
         draw.rectangle((40, 38, 46, 85), fill=MINT)
-        self.text(draw, (66, 35), "SYSTEM ONE / DOOM", "title")
+        self.text(draw, (66, 35),
+                  "TOOL-CALL AGENT / DOOM" if metadata.get("controller") == "tool_agent" else "SYSTEM ONE / DOOM",
+                  "title")
         draw.rounded_rectangle((1600, 36, 1880, 88), 12, fill="#173239", outline="#2c6269")
         self.text(draw, (1640, 49), "Qwen3-8B", "answer", MINT)
         draw.rounded_rectangle((40, 112, 1880, 188), 12, fill="#12232e", outline=STROKE)
@@ -275,7 +293,8 @@ class Composer:
         self.text(draw, (x + 16, y + 12), label, "label", CYAN)
         if freshness:
             self.text(draw, (x + w - 16, y + 12), freshness, "tiny", MUTED, "ra")
-        chosen = answer["choice"] if answer else "Deciding..."
+        chosen = answer["choice"] if answer else (
+            "Not called" if self.metadata.get("controller") == "tool_agent" else "Deciding...")
         if prominent:
             self.text(draw, (x + 16, y + 38), self.fit(self.description(key, chosen), "tiny", w - 32),
                       "tiny", MUTED)
@@ -286,6 +305,10 @@ class Composer:
                       self.fit(chosen, "compact", w - 155),
                       "compact", MINT if answer else MUTED, "ra")
         if not answer:
+            return
+        if answer.get("probabilities") is None:
+            self.text(draw, (x + 16, y + (106 if prominent else 43)),
+                      "TOOL CALL / NO PROBABILITY SCORES", "tiny", MUTED)
             return
         options = list(answer["probabilities"].items())
         columns = 1 if prominent else 2

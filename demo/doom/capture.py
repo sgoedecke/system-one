@@ -23,6 +23,8 @@ MODEL = "Qwen/Qwen3-8B"
 STANDING_ORDER = "Reach the campaign exit alive; kill all enemies in the way and collect supplies when needed."
 PLAN_HEADS = ("goal", "target")
 CONTROL_HEADS = ("dodge", "move", "strafe", "turn", "fire", "weapon", "use")
+RELEASED_CONTROLS = {"dodge":"Carry on","move":"Hold","strafe":"Hold","turn":"Hold",
+                     "fire":"Hold fire","weapon":"Keep","use":"Wait"}
 BUTTONS = [
     vzd.Button.MOVE_FORWARD_BACKWARD_DELTA, vzd.Button.MOVE_BACKWARD,
     vzd.Button.MOVE_LEFT, vzd.Button.MOVE_RIGHT,
@@ -446,6 +448,8 @@ def describe(obs):
         f"Forward corridor {'clear' if obs['clearance']['forward']>45 else 'blocked'}. Wall clearance: "+
         ", ".join(f"{k} {v}" for k,v in obs["clearance"].items())+
         f". Stuck: {obs['stuck']}. Door/switch immediately ahead: {bool(obs['interactions'])}."
+        + (f"\nCURRENT HELD CONTROLS: {json.dumps(obs['held_controls'])}."
+           if "held_controls" in obs else "")
     )
 
 
@@ -505,9 +509,12 @@ def infer(engine,obs,cache,heads,clock=time.perf_counter):
     questions={key:q for key,q in questions_for(obs, getattr(engine, "label_map", None)).items()
                if key in heads}
     start=clock()
-    result=engine.system_one(text,questions,cache_prefix=cache)
+    result=(engine.choose(text,questions) if getattr(engine,"inference_mode",None)=="tool_agent"
+            else engine.system_one(text,questions,cache_prefix=cache))
     latency=(clock()-start)*1000
-    if set(result.answers) != set(heads):
+    tool_agent=getattr(engine,"inference_mode",None)=="tool_agent"
+    if ((not result.answers or not set(result.answers).issubset(heads)) if tool_agent
+            else set(result.answers)!=set(heads)):
         raise ValueError(f"Expected answers for {heads}, got {tuple(result.answers)}")
     answers={key:{"choice":answer.choice,"probabilities":answer.probabilities} for key,answer in result.answers.items()}
     for key,answer in answers.items():
@@ -546,7 +553,7 @@ def infer_request(engine,request,cache,clock=time.perf_counter):
         raise ValueError(f"Unknown inference kind {kind}")
     completed=clock()
     result.update(kind=kind,episode=request["episode"],plan_id=request["plan_id"],
-                  evaluated_heads=list(PLAN_HEADS if kind=="plan" else CONTROL_HEADS),
+                  evaluated_heads=list(result["answers"]),
                   observation_frame=request["frame"],worker_started=started,worker_completed=completed,
                   worker_wall_ms=(completed-started)*1000,
                   planning_latency_ms=(completed-started)*1000 if kind=="plan" else None)
@@ -613,6 +620,8 @@ def main():
     parser.add_argument("--seed",type=int,default=7)
     parser.add_argument("--level",default="MAP01")
     parser.add_argument("--cache-prefix",action="store_true")
+    parser.add_argument("--controller",choices=("system-one","tool-agent"),default="system-one",
+                        help="Single-token choices or ordinary autoregressive native tool calls")
     parser.add_argument("--skill",type=int,choices=range(1,6),default=1)
     parser.add_argument("--probe",action="store_true")
     parser.add_argument("--labels",action="store_true",help="Use demo-only two-letter labels instead of numeric indexes")
@@ -623,6 +632,9 @@ def main():
     args=parser.parse_args()
     if not math.isfinite(args.seconds) or args.seconds <= 0 or round(args.seconds * FPS) < 1:
         parser.error("--seconds must be finite and cover at least one frame")
+    tool_agent=args.controller=="tool-agent"
+    if tool_agent and (args.labels or args.cache_prefix):
+        parser.error("--labels and --cache-prefix apply only to the system-one controller")
     args.output.mkdir(parents=True,exist_ok=False)
     frames=args.output/"frames"
     frames.mkdir()
@@ -653,6 +665,9 @@ def main():
             game.close()
         return
     engine_class=LabelSystemOne if args.labels else SystemOne
+    if tool_agent:
+        from demo.doom.tool_agent import ToolAgent
+        engine_class=ToolAgent
     try:
         engine=engine_class.from_pretrained(args.model,revision=args.revision,
             model_kwargs={"torch_dtype":torch.bfloat16,"device_map":args.device,"attn_implementation":"sdpa",
@@ -665,6 +680,7 @@ def main():
     recorded_questions=label_questions(QUESTIONS,label_map) if args.labels else QUESTIONS
     metadata={
         "fps":FPS,"width":640,"height":480,"model":args.model,"model_revision":getattr(engine.model.config,"_commit_hash",None),
+        "controller":"tool_agent" if tool_agent else "system_one",
         "gamelevel":args.level,"scenario":f"Freedoom 2 campaign {args.level}","seed":args.seed,"skill":args.skill,
         "standing_order":STANDING_ORDER,
         "questions":{k:{"instructions":q.instructions,"criteria":q.criteria} for k,q in recorded_questions.items()},
@@ -688,6 +704,15 @@ def main():
         "library_sha256":hashlib.sha256(Path(__import__("system_one.inference",fromlist=["x"]).__file__).read_bytes()).hexdigest(),
         "assets_sha256":hashlib.sha256(wad.read_bytes()).hexdigest(),"audio_sample_rate":44100,
     }
+    if tool_agent:
+        metadata.update(
+            label_encoding="native_tool_calls",
+            control_method="Ordinary autoregressive Qwen tool calls using one enum-argument tool per head. Goal then target planning; each control turn can call any subset of the seven control tools. Valid calls apply immediately on turn completion; uncalled controls retain their prior state, initially released. Previous controls remain held during generation. No SystemOne scoring or logit constraint.",
+            forward_passes_per_model_call=None,forward_passes_per_plan=None,
+            model_calls_per_plan=None,model_calls_per_control=None,max_attempts_per_tool_request=2,
+            timing="Turn latency includes chat templating, autoregressive generation, validation, and any retry. Planning includes goal and target requests. Raw generation timings and token counts are in tool-calls.json. Control gaps measure actual applications including intervening planning and polling.",
+            generation="Native Qwen chat-template tools, thinking disabled, greedy model.generate with normal decode KV caching. Previous tool selections are acknowledged in the next turn. No probability scores are reported.",
+            tool_backend_sha256=hashlib.sha256(Path(__import__("demo.doom.tool_agent",fromlist=["x"]).__file__).read_bytes()).hexdigest())
     if args.labels:
         (args.output/"labelmap.json").write_text(json.dumps(engine.label_validation,indent=2))
     try:
@@ -697,15 +722,22 @@ def main():
         target=next(p for p in nav.items if p["kind"]=="Exit")
         memory={"positions":[]}
         obs=observe(game,game.get_state(),nav,goal,target,memory)
+        if tool_agent:
+            obs["held_controls"]=dict(RELEASED_CONTROLS)
         print("MAP",len(nav.valid),"cells",len(nav.items),"items; starting",initial,flush=True)
         warmups=[]
         for _ in range(2):
             warm_request={"kind":"plan","episode":0,"plan_id":0,"frame":0,"observation":obs}
             warm_plan=infer_request(engine,warm_request,args.cache_prefix)
             warm_obs=observe(game,game.get_state(),nav,warm_plan["active_goal"],warm_plan["active_target"],memory)
+            if tool_agent:
+                warm_obs["held_controls"]=dict(RELEASED_CONTROLS)
             warm_control=infer_request(engine,dict(warm_request,kind="control",observation=warm_obs),args.cache_prefix)
             warmups.append({"plan":warm_plan,"control":warm_control})
         metadata["warmup_model_ms"]=sum(r["latency_ms"] for warmup in warmups for r in warmup.values())
+        if tool_agent:
+            engine.reset()
+            metadata["warmup_tool_attempts"]=len(engine.trace)
         memory={"positions":[]}
         (args.output/"metadata.json").write_text(json.dumps(metadata,indent=2))
         print("MODEL READY; recording",flush=True)
@@ -715,6 +747,7 @@ def main():
             audio.setsampwidth(2)
             audio.setframerate(44100)
             action=[0]*len(BUTTONS)
+            selected_controls={key:{"choice":choice} for key,choice in RELEASED_CONTROLS.items()}
             future=None
             request=None
             episode=1
@@ -736,10 +769,12 @@ def main():
             resets=[]
             events.write(json.dumps({"frame":0,"event":"episode_start","episode":1,"inventory":initial})+"\n")
             started=time.perf_counter()
+            metadata["recording_started_perf_counter"]=started
+            reset_tool_history=False
             for frame in range(round(args.seconds*FPS)):
                 if game.is_episode_finished() or game.is_player_dead():
                     reason="death" if game.is_player_dead() else "level_finished_or_timeout"
-                    if future:
+                    if future and (not tool_agent or future.done()):
                         discarded=future.result()
                         discarded_model_ms+=discarded["latency_ms"]
                         events.write(json.dumps({"frame":frame,"event":"discarded_episode_boundary_inference","result":discarded})+"\n")
@@ -748,6 +783,7 @@ def main():
                     last_kills=0
                     episode+=1
                     cadence.reset(episode)
+                    reset_tool_history=tool_agent
                     controls_plan_id=None
                     answer_frames={}
                     inv=start_episode(game,args.skill)
@@ -756,6 +792,7 @@ def main():
                     target=next(p for p in nav.items if p["kind"]=="Exit")
                     memory={"positions":[]}
                     action=[0]*len(BUTTONS)
+                    selected_controls={key:{"choice":choice} for key,choice in RELEASED_CONTROLS.items()}
                     event={"frame":frame,"event":"episode_reset","reason":reason,"episode":episode,"inventory":inv}
                     resets.append(event)
                     events.write(json.dumps(event)+"\n")
@@ -772,12 +809,18 @@ def main():
                         events.write(json.dumps({"frame":frame,"event":"discarded_stale_inference","result":completed})+"\n")
                         completed=None
                     elif completed["kind"]=="control":
-                        action=controls(completed["answers"])
+                        selected_controls.update(completed["answers"])
+                        action=controls(selected_controls)
                     else:
                         goal=completed["active_goal"]
                         target=completed["active_target"]
                 if future is None and completed is None:
+                    if reset_tool_history:
+                        engine.reset()
+                        reset_tool_history=False
                     obs=observe(game,state,nav,goal,target,memory)
+                    if tool_agent:
+                        obs["held_controls"]={key:answer["choice"] for key,answer in selected_controls.items()}
                     request={"kind":cadence.next_kind,"episode":episode,"plan_id":cadence.plan_id,
                              "frame":frame,"observation":obs,"submitted":time.perf_counter()}
                     future=worker.submit(infer_request,engine,request,args.cache_prefix)
@@ -831,6 +874,8 @@ def main():
                     # Submit from a fresh main-thread snapshot, without waiting another 35 Hz tick.
                     if not game.is_episode_finished() and not game.is_player_dead() and frame+1<round(args.seconds*FPS):
                         obs=observe(game,game.get_state(),nav,goal,target,memory)
+                        if tool_agent:
+                            obs["held_controls"]={key:answer["choice"] for key,answer in selected_controls.items()}
                         request={"kind":cadence.next_kind,"episode":episode,"plan_id":cadence.plan_id,
                                  "frame":frame+1,"observation":obs,"submitted":time.perf_counter()}
                         future=worker.submit(infer_request,engine,request,args.cache_prefix)
@@ -866,7 +911,11 @@ def main():
         (args.output/"metadata.json").write_text(json.dumps(metadata,indent=2))
         print("COMPLETE",json.dumps({k:v for k,v in metadata.items() if k not in {"questions","buttons"}}),flush=True)
     finally:
-        game.close()
+        try:
+            if tool_agent:
+                (args.output/"tool-calls.json").write_text(json.dumps(engine.trace,indent=2))
+        finally:
+            game.close()
 
 
 if __name__=="__main__":

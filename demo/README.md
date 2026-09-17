@@ -132,6 +132,46 @@ final unapplied inference may finish after `capture_wall_seconds` ends.
 `decisions` counts plan plus control rows; `control_updates` counts controls
 only. Events also record plan commits and discarded/final unapplied results.
 
+### Ordinary tool-calling agent comparison
+
+```sh
+python -m demo.doom.capture --controller tool-agent \
+  --output demo/output/doom-tool-agent --seconds 60 \
+  --seed 7 --level MAP01 --skill 1 --plan-every 3 \
+  --revision b968826d9c46dd6066d109eabc6255188de91218
+python -m demo.doom.render --input demo/output/doom-tool-agent \
+  --output demo/output/doom-tool-agent.mp4
+```
+
+This uses the same Qwen3-8B checkpoint, non-thinking mode, standing order,
+observations, decision criteria, game settings, and planning cadence. Each
+choice becomes a native Qwen tool with one `choice` enum argument, such as
+`move(choice="Forward")`. Only the output-format instructions change from
+index digits to tool calls. The model generates native `<tool_call>` messages
+autoregressively using `model.generate`, with tool-result acknowledgments
+available on subsequent turns. It does not invoke SystemOne inference, constrain
+logits to single-token choices, or run seven independent question prefills.
+
+Goal and target calls still precede control turns. Each control turn may call
+any subset of the seven tools; calls take effect on that turn's completion and
+the next turn receives a fresh game observation plus tool acknowledgments.
+Uncalled controls retain their previous state, initially released. There is
+no artificial wait for all seven tools to be called. Planning runs after three
+applied control turns, even if a turn updates only one control.
+The observation also lists currently held controls so the agent knows which
+buttons need releasing even if their last tool call is no longer in history.
+The game continues holding previous controls during generation.
+Invalid responses receive explicit error feedback with bounded retries; no
+default actions are substituted. Warmups are excluded from recording and their
+conversation history is cleared. Normal autoregressive KV caching remains
+enabled; `--cache-prefix` and `--labels` are SystemOne-only options.
+
+`tool-calls.json` preserves raw model responses, tool schemas, attempts, token
+counts, and timing, including warmup and unapplied final requests. The renderer
+identifies the tool-calling agent and shows selected arguments without fabricated
+choice probabilities. This compares two different inference protocols, not just
+GPU speeds; live gameplay can diverge even with the same scenario seed.
+
 Assets are the Freedoom WAD shipped by ViZDoom, not commercial Doom assets.
 Attribution: [Freedoom contributors](https://freedoom.github.io/),
 [license](../docs/demos/Freedoom-COPYING.adoc),
