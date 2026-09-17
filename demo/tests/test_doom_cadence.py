@@ -127,10 +127,22 @@ class CadenceTests(unittest.TestCase):
         obs.update(stuck=True)
         obs["clearance"].update(left=90, right=20)
         question = capture.questions_for(obs)["strafe"]
-        self.assertIn("stuck = True", question.instructions)
-        self.assertIn("left CLEAR; right BLOCKED", question.instructions)
-        self.assertIn("barrels", question.instructions)
+        self.assertIn("RECOVERY STATUS: JAMMED", question.instructions)
+        self.assertIn("Left CLEAR; right BLOCKED", question.instructions)
         self.assertEqual(list(question.criteria), ["Hold", "Strafe left", "Strafe right"])
+
+    def test_clear_sides_and_blocked_forward_do_not_imply_strafe_when_not_stuck(self):
+        for forward in (20, 90):
+            for left in (70, 71):
+                for right in (70, 71):
+                    obs = observation()
+                    obs["clearance"].update(forward=forward, left=left, right=right)
+                    question = capture.questions_for(obs)["strafe"]
+                    self.assertIn("RECOVERY STATUS: NORMAL", question.instructions)
+                    self.assertIn(f"Left {'CLEAR' if left > 70 else 'BLOCKED'}", question.instructions)
+                    self.assertIn(f"right {'CLEAR' if right > 70 else 'BLOCKED'}", question.instructions)
+                    self.assertIn("choose Hold regardless of side clearance", question.instructions)
+                    self.assertEqual(len(question.criteria), 3)
 
     def test_target_is_model_selected_conditioned_on_new_goal(self):
         result = self.run_request()
@@ -140,6 +152,8 @@ class CadenceTests(unittest.TestCase):
         self.assertIn("Stuck: False", self.engine.calls[0][0])
         self.assertIn("final destination distance 300", self.engine.calls[0][0])
         text, questions, cache = self.engine.calls[1]
+        self.assertIn(capture.STANDING_ORDER, text)
+        self.assertIn("Equipped shotgun", text)
         self.assertIn("NEW SELECTED PLANNING GOAL: Add armor", text)
         self.assertNotIn("Reach exit", text)
         self.assertEqual(list(questions["target"].criteria), ["Green armor"])
@@ -178,6 +192,14 @@ class CadenceTests(unittest.TestCase):
                 self.assertIn("two-letter option label", question.instructions)
                 self.assertNotIn("index digit", question.instructions)
                 self.assertNotIn("choice_index:", question.instructions)
+
+    def test_standing_order_reaches_planning_and_control_calls(self):
+        plan = self.run_request()
+        self.cadence.commit(plan, self.clock(), 1)
+        self.run_request(observation(plan["active_goal"], plan["active_target"]))
+        for text, _, _ in self.engine.calls:
+            self.assertIn("kill all enemies in the way", text)
+            self.assertIn(capture.STANDING_ORDER, text)
 
     def test_invalid_answers_and_model_errors_propagate(self):
         for head in ("goal", "target"):

@@ -20,6 +20,7 @@ from demo.labels import LabelSystemOne, label_questions
 
 FPS = 35
 MODEL = "Qwen/Qwen3-8B"
+STANDING_ORDER = "Reach the campaign exit alive; kill all enemies in the way and collect supplies when needed."
 PLAN_HEADS = ("goal", "target")
 CONTROL_HEADS = ("dodge", "move", "strafe", "turn", "fire", "weapon", "use")
 BUTTONS = [
@@ -59,11 +60,11 @@ QUESTIONS = {
             "Backward": "Stuck against an obstacle and backward clearance exceeds 65.",
         }),
     "strafe": Choice(
-        instructions="Choose sideways movement independently of forward/backward movement and turning. Sidestep obstacles when stuck, even if the wall-only forward clearance says clear. One index digit.",
+        instructions="Default to Hold: normal navigation uses movement and turning, not strafing. Sidestep only to recover when stuck, then return to Hold as soon as movement resumes. One index digit.",
         criteria={
-            "Hold": "Not stuck and forward clear, or neither side has clearance above 70.",
-            "Strafe left": "Stuck or forward blocked, and left clearance exceeds 70. Prefer left when both sides are clear.",
-            "Strafe right": "Stuck or forward blocked, left clearance is at most 70, and right clearance exceeds 70.",
+            "Hold": "Status NORMAL, regardless of side clearance. Also hold if both sides BLOCKED.",
+            "Strafe left": "Status JAMMED and left CLEAR.",
+            "Strafe right": "Status JAMMED and right CLEAR.",
         }),
     "turn": Choice(
         instructions="Turn toward the explicitly described AIM direction. Positive bearing means left. Examples: AIM left 40 degrees => choice_index:0; AIM left 5 => choice_index:1; AIM centered => choice_index:2; AIM right 5 => choice_index:3; AIM right 40 => choice_index:4." + ENDING,
@@ -436,6 +437,7 @@ def describe(obs):
     aim="centered" if abs(obs["aim_bearing"])<=2 else ("slightly " if abs(obs["aim_bearing"])<=12 else "moderately " if abs(obs["aim_bearing"])<=45 else "far ")+obs["aim_direction"]
     armor=obs["nearest_armor_distance"]
     return (
+        f"STANDING ORDER: {STANDING_ORDER}\n"
         f"CURRENT SITUATION: Health {obs['health']}; armor {obs['armor']}. {combat}\n"
         f"Equipped {obs['selected_weapon']}; equipped ammo {obs['selected_weapon_ammo']}; shells {obs['shells']}; pistol bullets {obs['bullets']}; own shotgun {obs['own_shotgun']}. Nearby armor distance: {armor}.\n"
         f"ACTIVE COMMITTED PLAN: {obs['active_goal']} / {obs['active_target']['name']}. All controls follow this plan.\n"
@@ -465,7 +467,7 @@ def questions_for(obs, label_map=None):
                   "Dodge right":"Threat DANGER, left BLOCKED, right CLEAR.",
                   "Dodge back":"Threat DANGER, sideways BLOCKED, backward CLEAR."})
     questions["strafe"]=Choice(
-        instructions=f"Sideways navigation: stuck = {obs['stuck']}; forward wall clearance {'CLEAR' if obs['clearance']['forward']>45 else 'BLOCKED'}; left {'CLEAR' if obs['clearance']['left']>70 else 'BLOCKED'}; right {'CLEAR' if obs['clearance']['right']>70 else 'BLOCKED'}. Wall clearance does not include barrels or other actors. When stuck, sidestep toward a clear side even if forward wall clearance is CLEAR. Emergency dodge takes priority over this strafe choice. One index digit.",
+        instructions=f"RECOVERY STATUS: {'JAMMED' if obs['stuck'] else 'NORMAL'}. Left {'CLEAR' if obs['clearance']['left']>70 else 'BLOCKED'}; right {'CLEAR' if obs['clearance']['right']>70 else 'BLOCKED'}. NORMAL means the player is not stuck: choose Hold regardless of side clearance. JAMMED means the player is stuck: choose a clear side, preferring left if both sides are clear. Never strafe into a blocked side. Return to Hold when status becomes NORMAL. Combat evasion is handled separately by dodge. One index digit.",
         criteria=QUESTIONS["strafe"].criteria)
     questions["weapon"]=Choice(
         instructions=f"Which weapon should be equipped? Shotgun {'LOADED' if obs['shells']>0 else 'EMPTY'}, shells {obs['shells']}; pistol bullets {obs['bullets']}. One index digit.",
@@ -498,7 +500,7 @@ def infer(engine,obs,cache,heads,clock=time.perf_counter):
     text=describe(obs)
     if tuple(heads) == ("target",):
         # The snapshot's route still describes the previous destination.
-        text="\n".join(text.splitlines()[:2])
+        text="\n".join(text.splitlines()[:3])
         text+=f"\nNEW SELECTED PLANNING GOAL: {obs['active_goal']}."
     questions={key:q for key,q in questions_for(obs, getattr(engine, "label_map", None)).items()
                if key in heads}
@@ -664,7 +666,7 @@ def main():
     metadata={
         "fps":FPS,"width":640,"height":480,"model":args.model,"model_revision":getattr(engine.model.config,"_commit_hash",None),
         "gamelevel":args.level,"scenario":f"Freedoom 2 campaign {args.level}","seed":args.seed,"skill":args.skill,
-        "standing_order":"Reach the campaign exit alive; fight threats and collect supplies when needed.",
+        "standing_order":STANDING_ORDER,
         "questions":{k:{"instructions":q.instructions,"criteria":q.criteria} for k,q in recorded_questions.items()},
         "buttons":[b.name for b in BUTTONS],"precision":"bfloat16",
         "gpu":torch.cuda.get_device_name(args.device) if args.device.startswith("cuda") else args.device,

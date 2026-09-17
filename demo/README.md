@@ -72,13 +72,18 @@ It does not introduce a policy adjustment.
 
 The model sees text built from visible actor labels, inventory, WAD item/exit
 coordinates, and a collision-grid A* waypoint bearing—not screenshots.
+Every planning and control prompt includes the standing order shown in the video:
+"Reach the campaign exit alive; kill all enemies in the way and collect supplies
+when needed."
 An initial plan calls `goal`, then calls `target` with candidates and context
 conditioned on the **newly chosen goal**. Both choices commit together.
 Each subsequent control inference batches only `dodge`, `move`, `strafe`, `turn`, `fire`,
 `weapon`, and `use`, from a fresh observation of that committed plan.
 `strafe` chooses Hold, Strafe left, or Strafe right independently of forward
-movement and turning. Its prompt allows sidestepping when stuck, including
-against actors such as barrels that wall clearance does not capture.
+movement and turning. Its prompt defaults to Hold and permits sidestepping
+only while stuck, including against actors such as barrels that wall clearance
+does not capture. Clear space beside the player or a wall ahead alone is not
+a reason to strafe; normal navigation uses movement and turning.
 An emergency dodge takes priority over navigation strafe, so opposing
 left/right buttons are never applied together. No scripted obstacle response
 is added: the model chooses whether and where to strafe.
