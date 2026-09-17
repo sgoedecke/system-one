@@ -4,47 +4,6 @@ Single-token Choice inference for Transformers causal LMs, using TypeSafe's
 question and response types. By default, all questions run in **one batched forward pass**.
 No server, HTTP transport, or generation loop.
 
-## Demos
-
-Both demos use a warm **Qwen3-8B** model on an RTX 4090.
-
-### Wikipedia race
-
-https://github.com/user-attachments/assets/68bf0f86-4357-4881-85c3-55df36a3beb6
-
-Baseball → Scientific American → Amateur astronomy → Sun in **3 hops**.
-A 100-way tournament selects among actual article links: **9.36 seconds
-excluding page loads**, or 27.85 seconds total. The race clock pauses while
-pages load. This experiment uses a demo-specific adapter with 100 single-token
-labels, rather than the library's default numeric indexes.
-[Download the MP4](docs/demos/wikirace-qwen3-8b.mp4).
-
-### Doom level
-
-https://github.com/user-attachments/assets/07938d1f-3c2a-4067-8c4b-9e2160e93162
-
-100 seconds of Freedoom MAP01 with eight planning and control choices.
-Starting with two shotgun shells forces a pistol switch; later goals include
-collecting armor and reaching a medkit. The model receives textual game-state
-observations and route bearings, not screenshots. This selected take uses easy
-difficulty and does not reach the exit.
-[Download the MP4](docs/demos/doom-qwen3-8b.mp4).
-
-The demos enable shared-prefix caching: multi-question calls share a prefix
-prefill before a batched question-suffix forward; single-question calls use one
-forward. The Wikipedia race also batches tournament groups across multiple calls.
-These are demonstrations, not robustness benchmarks.
-
-**[Run both demos from source](demo/README.md)**: self-contained capture,
-Wikipedia fetch bridge, audit, and rendering modules live in `demo/`, with
-separate dependencies. Doom also offers an optional `--labels` mode for the
-same demo-only two-letter adapter; the library's default behavior is unchanged.
-
-Game assets: [Freedoom contributors](https://freedoom.github.io/), used through
-[ViZDoom](https://vizdoom.farama.org/); [Freedoom license](docs/demos/Freedoom-COPYING.adoc).
-Article excerpts: Wikipedia contributors, [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/);
-source article URLs appear in the video.
-
 ## Usage
 
 ```sh
@@ -73,6 +32,49 @@ result = engine.system_one(
 print(result.choices["team"].choice)
 print(result.choices["team"].probabilities)
 ```
+
+## Demos
+
+Both demos use a warm **Qwen3-8B** model on an RTX 4090.
+
+### Doom level
+
+https://github.com/user-attachments/assets/07938d1f-3c2a-4067-8c4b-9e2160e93162
+
+100 seconds of Freedoom MAP01 with eight planning and control choices.
+Starting with two shotgun shells forces a pistol switch; later goals include
+collecting armor and reaching a medkit. The model receives textual game-state
+observations and route bearings, not screenshots. This selected take uses easy
+difficulty and does not reach the exit.
+[Download the MP4](docs/demos/doom-qwen3-8b.mp4).
+
+### Wikipedia race
+
+https://github.com/user-attachments/assets/68bf0f86-4357-4881-85c3-55df36a3beb6
+
+Baseball → Scientific American → Amateur astronomy → Sun in **3 hops**.
+A 100-way tournament selects among actual article links: **9.36 seconds
+excluding page loads**, or 27.85 seconds total. The race clock pauses while
+pages load. This experiment uses a demo-specific adapter with 100 single-token
+labels, rather than the library's default numeric indexes.
+[Download the MP4](docs/demos/wikirace-qwen3-8b.mp4).
+
+The demos enable shared-prefix caching: multi-question calls share a prefix
+prefill before a batched question-suffix forward; single-question calls use one
+forward. The Wikipedia race also batches tournament groups across multiple calls.
+These are demonstrations, not robustness benchmarks.
+
+**[Run both demos from source](demo/README.md)**: self-contained capture,
+Wikipedia fetch bridge, audit, and rendering modules live in `demo/`, with
+separate dependencies. Doom also offers an optional `--labels` mode for the
+same demo-only two-letter adapter; the library's default behavior is unchanged.
+
+Game assets: [Freedoom contributors](https://freedoom.github.io/), used through
+[ViZDoom](https://vizdoom.farama.org/); [Freedoom license](docs/demos/Freedoom-COPYING.adoc).
+Article excerpts: Wikipedia contributors, [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/);
+source article URLs appear in the video.
+
+## How it works
 
 Each question uses the model's chat template and the assistant prefill
 `choice_index:`. Transformers' `PrefixConstrainedLogitsProcessor` restricts the
