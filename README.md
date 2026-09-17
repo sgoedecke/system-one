@@ -35,7 +35,7 @@ print(result.choices["team"].probabilities)
 
 ## Demos
 
-Both demos use a warm **Qwen3-8B** model on an RTX 4090.
+The two embedded demos use a warm **Qwen3-8B** model on an RTX 4090.
 
 ### Doom level
 
@@ -48,6 +48,14 @@ observations and route bearings, not screenshots. This selected take uses easy
 difficulty and does not reach the exit.
 [Download the MP4](docs/demos/doom-qwen3-8b.mp4).
 
+For comparison, [watch a regular tool-calling agent play Doom for 60 seconds](docs/demos/doom-qwen3-8b-tool-agent.mp4).
+Using the same Qwen3-8B model, standing order, and decision criteria, it was
+**3.5x slower between applied control updates** than a newer System One run
+on the same H100: 600ms versus 172ms median. It also updated **just one control
+in 59 of 60 turns** (two controls in the remaining turn), rather than selecting
+all seven controls together as System One does. These are single-run observations,
+not a general limit on tool calling.
+
 ### Wikipedia race
 
 https://github.com/user-attachments/assets/68bf0f86-4357-4881-85c3-55df36a3beb6
@@ -59,7 +67,7 @@ pages load. This experiment uses a demo-specific adapter with 100 single-token
 labels, rather than the library's default numeric indexes.
 [Download the MP4](docs/demos/wikirace-qwen3-8b.mp4).
 
-The demos enable shared-prefix caching: multi-question calls share a prefix
+The System One demos enable shared-prefix caching: multi-question calls share a prefix
 prefill before a batched question-suffix forward; single-question calls use one
 forward. The Wikipedia race also batches tournament groups across multiple calls.
 These are demonstrations, not robustness benchmarks.
