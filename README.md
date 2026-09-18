@@ -1,8 +1,8 @@
 # System One
 
-Single-token Choice inference for Transformers causal LMs, using TypeSafe's
-question and response types. By default, all questions run in **one batched forward pass**.
-No server, HTTP transport, or generation loop.
+Turn any LLM into a [System One](https://typesafe.ai/blog/introducing-system-one-models-and-jev) model like Jev: a fast general classifier that you can supply a set of questions to and get an answer in a single forward pass.
+
+The code is vibe-coded but I wrote this README by hand.
 
 ## Usage
 
@@ -35,47 +35,26 @@ print(result.choices["team"].probabilities)
 
 ## Demos
 
-The two embedded demos use a warm **Qwen3-8B** model on an RTX 4090.
+I reimplemented the Doom and Wikiracing demos from the Jev release post using **Qwen3-8B**.
 
 ### Doom level
 
 https://github.com/user-attachments/assets/07938d1f-3c2a-4067-8c4b-9e2160e93162
 
-100 seconds of Freedoom MAP01 with eight planning and control choices.
-Starting with two shotgun shells forces a pistol switch; later goals include
-collecting armor and reaching a medkit. The model receives textual game-state
-observations and route bearings, not screenshots. This selected take uses easy
-difficulty and does not reach the exit.
+Here it is playing Freedoom MAP0. We start with two shotgun shells to force a switch to the pistol, and you can see the model choosing to pick up armor and health later on in the level.
 [Download the MP4](docs/demos/doom-qwen3-8b.mp4).
 
-For comparison, [watch a regular tool-calling agent play Doom for 60 seconds](docs/demos/doom-qwen3-8b-tool-agent.mp4).
-Using the same Qwen3-8B model, standing order, and decision criteria, it was
-**3.5x slower between applied control updates** than a newer System One run
-on the same H100: 600ms versus 172ms median. It also updated **just one control
-in 59 of 60 turns** (two controls in the remaining turn), rather than selecting
-all seven controls together as System One does. These are single-run observations,
-not a general limit on tool calling.
+For comparison, [here's how the same model does with ordinary tool calls](docs/demos/doom-qwen3-8b-tool-agent.mp4).
+Using the same model and prompt, it was **3.5x slower between actions** than a newer System One run: 600ms versus 172ms median. It also tended to just do one input per-turn, rather than the System One version, which routinely entered many simultaneous inputs (strafing + turning + firing, for instance).
 
 ### Wikipedia race
 
 https://github.com/user-attachments/assets/68bf0f86-4357-4881-85c3-55df36a3beb6
 
-Baseball → Scientific American → Amateur astronomy → Sun in **3 hops**.
-A 100-way tournament selects among actual article links: **9.36 seconds
-excluding page loads**, or 27.85 seconds total. The race clock pauses while
-pages load. This experiment uses a demo-specific adapter with 100 single-token
-labels, rather than the library's default numeric indexes.
+The System One model jumps from Baseball → Scientific American → Amateur astronomy → Sun in **3 hops**. Because of how many choices there are (over 1k links on the baseball page), this demo doesn't use the regular choice indexes. I found labels worked better.
 [Download the MP4](docs/demos/wikirace-qwen3-8b.mp4).
 
-The System One demos enable shared-prefix caching: multi-question calls share a prefix
-prefill before a batched question-suffix forward; single-question calls use one
-forward. The Wikipedia race also batches tournament groups across multiple calls.
-These are demonstrations, not robustness benchmarks.
-
-**[Run both demos from source](demo/README.md)**: self-contained capture,
-Wikipedia fetch bridge, audit, and rendering modules live in `demo/`, with
-separate dependencies. Doom also offers an optional `--labels` mode for the
-same demo-only two-letter adapter; the library's default behavior is unchanged.
+**[Run both demos from source](demo/README.md)**.
 
 Game assets: [Freedoom contributors](https://freedoom.github.io/), used through
 [ViZDoom](https://vizdoom.farama.org/); [Freedoom license](docs/demos/Freedoom-COPYING.adoc).
@@ -84,44 +63,4 @@ source article URLs appear in the video.
 
 ## How it works
 
-Each question uses the model's chat template and the assistant prefill
-`choice_index:`. Transformers' `PrefixConstrainedLogitsProcessor` restricts the
-next token to that row's option indexes. Greedy selection picks the best index;
-the library maps it back to the option name and returns a `SystemOneResponse`.
-
-Supported index tokens are resolved once when the engine is created, using
-the fixed `choice_index:` prefix. Each request tokenizes each question prompt
-only once and uses the cached token allowlist; it does not re-encode prompts
-with candidate answers. Option counts beyond the tokenizer's supported range
-raise `ValueError`; digit-splitting tokenizers such as Qwen2.5 support at most
-ten options (0-9). Models without a chat template use a
-plain instruction/assistant prompt. Only Choice questions are supported, either
-as SDK objects or dictionaries with `type="choice"`.
-
-Wrap an existing model with `SystemOne(model, tokenizer)` to control device
-placement. `from_pretrained` accepts `revision`, `model_kwargs`, and
-`tokenizer_kwargs`; loading defaults to CPU. The full batch must fit memory.
-Inputs are never truncated. Input usage counts unpadded tokens across questions;
-output usage counts one selected token per question.
-
-## Shared-prefix caching
-
-Pass `cache_prefix=True` to `system_one(...)` to prefill the common token prefix
-once, then evaluate all question suffixes in a second, batched forward. Prompts
-are unchanged: the split is found from the actual token ids, including the shared
-state. Single-question requests still use one forward.
-
-This reduces repeated prefill computation, especially for long shared state.
-The simple Transformers implementation **copies the prefix KV cache across the
-batch**, so it can use more memory than the default path. Cache creation and
-copying happen on every call; nothing is retained between requests. Models must
-support the Transformers `Cache` API and explicit position ids. Logical input
-usage is unchanged; fewer token positions are actually evaluated. Reduced-precision
-cached and uncached computations can produce different probabilities and
-occasionally different selections.
-
-Probabilities are softmax over valid indexes, **not calibrated confidence**.
-The `confidence` field is one minus normalized entropy, not TypeSafe's proprietary
-formula. This provides the Choice interface, not Jev's trained decision quality.
-
-Run `python -m unittest -v` for the focused library tests.
+For each question, we use the model's chat template and prefill `choice_index:` into the answer. We then constrain our logit sampling so we only select tokens that match a choice index. Picking the most likely index gives us the model's choice in a single forward pass. There's some machinery (`cache_prefix=True`) to ensure we can batch multiple questions without doing the prefill step each time: if that's set, we prefill once then do a forward pass to evaluate all the question suffixes. I strongly recommend doing this if you have >3 questions.
